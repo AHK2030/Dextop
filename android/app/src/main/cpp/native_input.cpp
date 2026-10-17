@@ -239,6 +239,17 @@ struct Device {
     input_absinfo yInfo{};
     int currentSlot = 0;
     std::array<SlotState, kMaxPhysicalSlots> slots{};
+    // Some non-Samsung touch drivers (common on MediaTek/Unisoc devices)
+    // use the legacy multitouch protocol A: no ABS_MT_SLOT, contacts are
+    // separated by SYN_MT_REPORT and releases are only signalled by an
+    // empty frame or BTN_TOUCH=0, never by ABS_MT_TRACKING_ID=-1.
+    bool protocolA = false;
+    bool hasTrackingId = true;
+    SlotState pendingA{};
+    bool pendingAValid = false;
+    bool pendingAIdSet = false;
+    std::vector<SlotState> frameA;
+    bool btnTouchReleased = false;
 
     ~Device() {
         if (fd >= 0) close(fd);
@@ -258,6 +269,11 @@ struct Device {
         currentSlot = 0;
         for (auto& slot : slots) slot = {};
         for (auto& slot : slots) slot.trackingId = -1;
+        pendingA = {};
+        pendingAValid = false;
+        pendingAIdSet = false;
+        frameA.clear();
+        btnTouchReleased = false;
     }
 };
 
@@ -626,6 +642,8 @@ private:
     float gestureMaxTravel_ = 0;
     float lastLocalX_ = 0;
     float lastLocalY_ = 0;
+    int mousePrimaryTrackingId_ = -2;
+    int mouseLastContactCount_ = 0;
     bool gestureMoved_ = false;
     bool gestureTwoFinger_ = false;
 
@@ -1197,8 +1215,11 @@ private:
         if (ioctl(fd, EVIOCGPROP(sizeof(props)), props.data()) < 0) return false;
         if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits.data()) < 0) return false;
         if (!testBit(props, INPUT_PROP_DIRECT) || testBit(props, INPUT_PROP_POINTER)) return false;
-        if (!testBit(absBits, ABS_MT_POSITION_X) || !testBit(absBits, ABS_MT_POSITION_Y) ||
-            !testBit(absBits, ABS_MT_TRACKING_ID)) return false;
+        if (!testBit(absBits, ABS_MT_POSITION_X) || !testBit(absBits, ABS_MT_POSITION_Y)) return false;
+        device.protocolA = !testBit(absBits, ABS_MT_SLOT);
+        device.hasTrackingId = testBit(absBits, ABS_MT_TRACKING_ID);
+        // Protocol B without tracking ids cannot report releases reliably.
+        if (!device.protocolA && !device.hasTrackingId) return false;
         if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &device.xInfo) < 0 ||
             ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &device.yInfo) < 0) return false;
         return device.xInfo.maximum > device.xInfo.minimum && device.yInfo.maximum > device.yInfo.minimum;
@@ -1249,7 +1270,9 @@ private:
                 << " id=" << device->id.vendor << ":" << device->id.product
                 << " x=[" << device->xInfo.minimum << ".." << device->xInfo.maximum
                 << "] y=[" << device->yInfo.minimum << ".." << device->yInfo.maximum
-                << "] resolution=" << device->xInfo.resolution << ":" << device->yInfo.resolution;
+                << "] resolution=" << device->xInfo.resolution << ":" << device->yInfo.resolution
+                << " protocol=" << (device->protocolA ? "A" : "B")
+                << " trackingId=" << device->hasTrackingId;
             state("device_discovered", out.str());
             devices_.emplace(fd, std::move(device));
         }
@@ -1270,6 +1293,19 @@ private:
         }
     }
 
+    void commitProtocolAContact(Device& device) {
+        const bool released = device.pendingAIdSet && device.pendingA.trackingId < 0;
+        if (device.pendingAValid && !released &&
+            device.frameA.size() < static_cast<size_t>(kMaxPhysicalSlots)) {
+            SlotState contact = device.pendingA;
+            if (!device.pendingAIdSet) contact.trackingId = static_cast<int>(device.frameA.size());
+            device.frameA.push_back(contact);
+        }
+        device.pendingA = {};
+        device.pendingAValid = false;
+        device.pendingAIdSet = false;
+    }
+
     void processRawEvent(Device& device, const input_event& event) {
         rawEvents_.fetch_add(1);
         const Config cfg = configSnapshot();
@@ -1279,7 +1315,27 @@ private:
                 static_cast<long long>(event.time.tv_usec), event.type, event.code, event.value,
                 device.currentSlot);
         }
-        if (event.type == EV_ABS) {
+        if (device.protocolA && event.type == EV_ABS) {
+            switch (event.code) {
+                case ABS_MT_TRACKING_ID:
+                    device.pendingA.trackingId = event.value;
+                    device.pendingAIdSet = true;
+                    device.pendingAValid = true;
+                    break;
+                case ABS_MT_POSITION_X: device.pendingA.x = event.value; device.pendingAValid = true; break;
+                case ABS_MT_POSITION_Y: device.pendingA.y = event.value; device.pendingAValid = true; break;
+                case ABS_MT_TOUCH_MAJOR: device.pendingA.major = event.value; break;
+                default: break;
+            }
+        } else if (device.protocolA && event.type == EV_SYN && event.code == SYN_MT_REPORT) {
+            commitProtocolAContact(device);
+        } else if (event.type == EV_KEY && event.code == BTN_TOUCH) {
+            // Many non-Samsung drivers only reliably report the final
+            // release through BTN_TOUCH. Without this, the gesture never
+            // ends: taps never become clicks and the next touch is measured
+            // from the old finger position, which makes the cursor jump.
+            device.btnTouchReleased = event.value == 0;
+        } else if (event.type == EV_ABS) {
             if (event.code == ABS_MT_SLOT) {
                 device.currentSlot = std::clamp(event.value, 0, kMaxPhysicalSlots - 1);
             } else {
@@ -1301,6 +1357,20 @@ private:
             state("syn_dropped", "path=" + device.path);
         } else if (event.type == EV_SYN && event.code == SYN_REPORT) {
             rawFrames_.fetch_add(1);
+            if (device.protocolA) {
+                commitProtocolAContact(device);
+                for (auto& slot : device.slots) slot = {-1, 0, 0, 0};
+                for (size_t index = 0; index < device.frameA.size(); ++index) {
+                    device.slots[index] = device.frameA[index];
+                }
+                device.frameA.clear();
+                device.pendingA = {};
+                device.pendingAValid = false;
+            }
+            if (device.btnTouchReleased) {
+                for (auto& slot : device.slots) slot = {-1, 0, 0, 0};
+                device.btnTouchReleased = false;
+            }
             handleFrame(device, device.contacts());
         }
     }
@@ -1402,6 +1472,8 @@ private:
             gestureStartY_ = contacts.front().localY;
             lastLocalX_ = gestureStartX_;
             lastLocalY_ = gestureStartY_;
+            mousePrimaryTrackingId_ = contacts.front().trackingId;
+            mouseLastContactCount_ = static_cast<int>(contacts.size());
         }
         gestureMaxTravel_ = 0;
         touchpadSecondTap_ = false;
@@ -1635,11 +1707,36 @@ private:
             finishMouseGesture(cfg);
             return;
         }
-        const auto& first = contacts.front();
-        const float dx = (first.localX - lastLocalX_) * cfg.mouseSensitivity;
-        const float dy = (first.localY - lastLocalY_) * cfg.mouseSensitivity;
+        const MappedContact* primary = nullptr;
+        for (const auto& contact : contacts) {
+            if (contact.trackingId == mousePrimaryTrackingId_) { primary = &contact; break; }
+        }
+        const bool primaryChanged = primary == nullptr ||
+            static_cast<int>(contacts.size()) != mouseLastContactCount_;
+        if (primary == nullptr) primary = &contacts.front();
+        const auto& first = *primary;
+        float rawDx = first.localX - lastLocalX_;
+        float rawDy = first.localY - lastLocalY_;
         lastLocalX_ = first.localX;
         lastLocalY_ = first.localY;
+        mouseLastContactCount_ = static_cast<int>(contacts.size());
+        // When the tracked finger changes (finger added/lifted, slot reuse,
+        // or a driver that reorders contacts) the delta between two
+        // different fingers is meaningless and shows up as a cursor jump.
+        // Rebase instead of moving. Also drop single-frame teleports that
+        // are physically impossible for one finger.
+        const Rect* rect = targetRect(cfg);
+        const float diagonal = rect != nullptr
+            ? std::hypot(static_cast<float>(rect->width()), static_cast<float>(rect->height()))
+            : 1000.0f;
+        if (primaryChanged || std::hypot(rawDx, rawDy) > diagonal * 0.25f) {
+            if (!primaryChanged) state("mouse_jump_filtered", "distance=" + std::to_string(std::hypot(rawDx, rawDy)));
+            mousePrimaryTrackingId_ = first.trackingId;
+            rawDx = 0;
+            rawDy = 0;
+        }
+        const float dx = rawDx * cfg.mouseSensitivity;
+        const float dy = rawDy * cfg.mouseSensitivity;
         if (contacts.size() >= 2) {
             gestureTwoFinger_ = true;
             if (std::fabs(dx) > 0.01f || std::fabs(dy) > 0.01f) {
@@ -1747,6 +1844,8 @@ private:
         gestureMaxTravel_ = 0;
         lastLocalX_ = 0;
         lastLocalY_ = 0;
+        mousePrimaryTrackingId_ = -2;
+        mouseLastContactCount_ = 0;
         gestureMoved_ = false;
         gestureTwoFinger_ = false;
         touchpadSecondTap_ = false;
