@@ -10255,7 +10255,11 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         setOverlayFocusable(true)
         surfaceView?.post {
             surfaceView?.requestFocus()
-            surfaceView?.requestPointerCapture()
+            // Keep physical mouse events absolute. Pointer capture hides the
+            // system pointer and switches events to relative coordinates,
+            // while the forwarding path expects absolute surface positions;
+            // capturing therefore made the pointer jump and dropped clicks.
+            surfaceView?.releasePointerCapture()
         }
         if (!wasActive) {
             OperationLog.i(
@@ -10878,22 +10882,39 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             .getOrDefault(false)
     }
 
-    /** Forwards physical mouse movement, buttons and wheel input to the desktop display. */
+    /**
+     * Forwards physical mouse movement, buttons and wheel input to the desktop display.
+     *
+     * This is independent of [routePhysicalMouseToDextop]. That flag controls whether
+     * Android's system-wide device associations are changed to bind physical input to
+     * an external display. Events delivered to Dextop's own surface must always reach
+     * the virtual display, including on Samsung devices where those associations are
+     * unavailable and the routing controls stay disabled.
+     */
     private fun forwardMouseEvent(source: MotionEvent, view: View): Boolean {
-        if (!routePhysicalMouseToDextop || targetDisplayId < 0 || view.width <= 0 || view.height <= 0) return false
-        return runCatching {
-            val event = MotionEvent.obtain(source)
+        if (targetDisplayId < 0 || view.width <= 0 || view.height <= 0) return false
+        val event = MotionEvent.obtain(source)
+        return try {
             event.transform(Matrix().apply {
                 setScale(targetWidth.toFloat() / view.width, targetHeight.toFloat() / view.height)
             })
-            check(inputDispatcher.send(event, targetDisplayId))
-
-            cursorX = event.x.coerceIn(0f, targetWidth - 1f)
-            cursorY = event.y.coerceIn(0f, targetHeight - 1f)
+            if (!inputDispatcher.send(event, targetDisplayId)) {
+                Log.w(
+                    logTag,
+                    "mouse forwarding rejected display=$targetDisplayId action=${source.actionMasked}"
+                )
+                false
+            } else {
+                cursorX = event.x.coerceIn(0f, targetWidth - 1f)
+                cursorY = event.y.coerceIn(0f, targetHeight - 1f)
+                true
+            }
+        } catch (t: Throwable) {
+            Log.e(logTag, "mouse forwarding failed", t)
+            false
+        } finally {
             event.recycle()
-            true
-        }.onFailure { Log.e(logTag, "mouse forwarding failed", it) }
-            .getOrDefault(false)
+        }
     }
 
     private fun injectTouch(action: Int, x: Float, y: Float) {
