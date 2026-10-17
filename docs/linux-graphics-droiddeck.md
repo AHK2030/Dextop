@@ -136,10 +136,29 @@ benchmark. No installed Dextop display/input path has been switched.
 ## Default build (2026-10-18)
 
 The normal APK now builds the compositor with `DEXTOP_WAYLAND_GPU`, vendors
-adrenotools (BSD-2-Clause, `third_party/adrenotools`) and ships its own Mesa
-25.0.7 Turnip for Android as `libvulkan_dextop_turnip.so`, built by
-`tool/build_android_turnip.sh` (no DroidDeck binary). The Linux service points
+adrenotools (BSD-2-Clause, `third_party/adrenotools`) and ships the Android
+half of DroidDeck's DD-Turnip v0.2.0 (Mesa 26.3-devel, Adreno 6xx to 8xx) as
+`libvulkan_dextop_turnip.so` (see `third_party/README.md`). The Linux service points
 the compositor at it; when it is missing or fails, windows keep the CPU path.
 On the Xperia (A401SO) WezTerm launched from Kickoff rendered through guest
 Turnip/Zink and was GPU-presented by this driver. Gamescope/X11 GPU
 presentation and subsurface GPU composition remain open.
+
+## Prebuilt GPU packages (2026-10-18)
+
+Nothing GPU-related is compiled on the device any more. Container setup
+installs a prebuilt package (`LinuxCatalog.GPU_PACKAGE`), downloaded and
+checked by SHA-256: currently DD-Turnip v0.2.0, whose Linux driver goes to
+`/opt/dextop-mesa/lib` with an ICD manifest at the old path, while the
+distribution's Zink runs OpenGL on it. This covers Adreno 8xx (the Galaxy's
+Adreno 840), which Mesa 25.0.7 did not know. A package may later add a `mesa`
+directory (Mesa GL/EGL built for KGSL, laid out like `/opt/dextop-mesa`); only
+then is the Wayland GPU path (`wayland-ready`) enabled, so new containers run
+Wayland-capable applications through X11 until such a package exists.
+
+Debian 13's Mesa 25.0.7 Zink renders correctly (verified by readback) but
+never presents to Xvfb, which has no DRI3: every GLX window stayed black on
+both phones, with either Turnip. Debian containers therefore install Mesa 26
+from trixie-backports (prebuilt) in the GPU step. With it, glxgears on the
+Galaxy (Adreno 840, DD-Turnip, Zink, `MESA_VK_WSI_DEBUG=sw`,
+`LIBGL_KOPPER_DRI2=true`) is visible at about 1660 FPS.
