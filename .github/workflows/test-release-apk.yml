@@ -1,0 +1,68 @@
+name: Test Release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-release-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build arm64 release APK with a test key
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.6
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Throwaway signing key for local testing only. This key does not match
+      # official Dextop releases, so an existing Dextop install must be removed
+      # before installing this test build.
+      - name: Generate test signing key
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/debug-test.jks" \
+            -storepass dextoptest -keypass dextoptest \
+            -alias dextoptest -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Dextop Test, O=Dextop, C=US"
+
+      - name: Build release APK
+        env:
+          DEXTOP_KEYSTORE_FILE: debug-test.jks
+          DEXTOP_KEY_ALIAS: dextoptest
+          DEXTOP_STORE_PASSWORD: dextoptest
+          DEXTOP_KEY_PASSWORD: dextoptest
+        run: >
+          flutter build apk --flavor github --release
+          --target-platform android-arm64
+          --dart-define=DISTRIBUTION_CHANNEL=github
+
+      - name: Upload test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dextop-test-release-${{ github.sha }}
+          path: build/app/outputs/flutter-apk/app-github-release.apk
+          if-no-files-found: error
+          retention-days: 14
