@@ -1941,8 +1941,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             .getBoolean(KEY_DIRECT_TOUCH, false)
         // The overlay routing controls were retired. Leave physical devices
         // under Android's normal display routing instead of changing them.
-        routePhysicalMouseToDextop = false
-        routePhysicalKeyboardToDextop = false
+        routePhysicalMouseToDextop = true
+        routePhysicalKeyboardToDextop = true
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .remove(KEY_ROUTE_MOUSE)
             .remove(KEY_ROUTE_KEYBOARD)
