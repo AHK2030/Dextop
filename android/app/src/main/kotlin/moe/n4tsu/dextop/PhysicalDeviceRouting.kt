@@ -2,6 +2,7 @@ package moe.n4tsu.dextop
 
 import android.content.Context
 import android.hardware.display.DisplayManager
+import android.os.SystemClock
 import android.view.Display
 import android.view.InputDevice
 import java.lang.reflect.Method
@@ -50,11 +51,13 @@ internal class PhysicalInputRouter(
         privilegedAccess.service("input", "android.hardware.input.IInputManager")
     }
     private val methods by lazy { discoverOperations(service.javaClass) }
+    // Tracks requested associations for cleanup, not proof of effective routing.
     private val routedKeys = linkedSetOf<String>()
+    private val associationAttempts = mutableMapOf<String, Long>()
     private var routedDisplayUniqueId: String? = null
 
     fun routeConnectedDevices(display: Display, mouse: Boolean = true, keyboard: Boolean = true): Int {
-        clearStaleAssociations()
+        restore()
         val uniqueId = displayUniqueId(display) ?: return 0
         routedDisplayUniqueId = uniqueId
         eligibleDevices(mouse, keyboard).forEach { device -> route(device, uniqueId) }
@@ -63,23 +66,38 @@ internal class PhysicalInputRouter(
     }
 
     fun refresh(display: Display, mouse: Boolean = true, keyboard: Boolean = true): Int {
-        val uniqueId = routedDisplayUniqueId ?: displayUniqueId(display) ?: return routedKeys.size
+        // Never reuse an association target from a destroyed/recreated display.
+        val uniqueId = displayUniqueId(display) ?: return routedKeys.size
+        if (routedDisplayUniqueId != null && routedDisplayUniqueId != uniqueId) restore()
+        routedDisplayUniqueId = uniqueId
         val eligible = eligibleDevices(mouse, keyboard)
+        val now = SystemClock.uptimeMillis()
         eligible.forEach { device ->
             val key = associationKey(device) ?: return@forEach
-            if (key !in routedKeys && associate(device, uniqueId)) routedKeys += key
+            val associatedId = associatedDisplayId(device)
+            val lastAttempt = associationAttempts[key]
+            val retryReady = lastAttempt == null || now - lastAttempt >= ASSOCIATION_RETRY_DELAY_MS
+            // InputReader applies associations asynchronously. Allow it to settle
+            // before retrying, and do not treat an unavailable hidden getter as
+            // a confirmed mismatch (that would reset working OEM routing).
+            val needsAssociation = key !in routedKeys ||
+                (associatedId != null && associatedId != display.displayId)
+            if (needsAssociation && retryReady) {
+                associationAttempts[key] = now
+                if (associate(device, uniqueId)) routedKeys += key
+            }
         }
         val present = eligible.mapNotNull(::associationKey).toSet()
         routedKeys.filter { it !in present }.toList().forEach { key ->
             removeAssociation(key)
             routedKeys -= key
         }
+        associationAttempts.keys.retainAll(present)
         persist()
         return routedKeys.size
     }
 
     fun apply(display: Display, mouse: Boolean, keyboard: Boolean): Int {
-        restore()
         return routeConnectedDevices(display, mouse, keyboard)
     }
 
@@ -90,6 +108,7 @@ internal class PhysicalInputRouter(
         // A recreated Dextop display can keep the same input descriptor. Drop
         // the previous target before assigning the device to the new display.
         removeAssociation(key)
+        associationAttempts[key] = SystemClock.uptimeMillis()
         if (!associate(device, uniqueId)) return false
         routedKeys += key
         routedDisplayUniqueId = uniqueId
@@ -102,6 +121,7 @@ internal class PhysicalInputRouter(
         val key = "descriptor:$value"
         removeAssociation(key)
         routedKeys -= key
+        associationAttempts.remove(key)
         persist()
     }
 
@@ -126,13 +146,9 @@ internal class PhysicalInputRouter(
         val keys = (routedKeys + preferences.getStringSet(KEY_ASSOCIATIONS, emptySet()).orEmpty()).toSet()
         keys.forEach(::removeAssociation)
         routedKeys.clear()
+        associationAttempts.clear()
         routedDisplayUniqueId = null
         preferences.edit().clear().apply()
-    }
-
-    private fun clearStaleAssociations() {
-        preferences.getStringSet(KEY_ASSOCIATIONS, emptySet()).orEmpty().forEach(::removeAssociation)
-        preferences.edit().clear().commit()
     }
 
     private fun eligibleDevices(mouse: Boolean, keyboard: Boolean): List<InputDevice> = InputDevice.getDeviceIds().toList().mapNotNull(InputDevice::getDevice)
@@ -156,6 +172,7 @@ internal class PhysicalInputRouter(
 
     private fun route(device: InputDevice, displayUniqueId: String) {
         val key = associationKey(device) ?: return
+        associationAttempts[key] = SystemClock.uptimeMillis()
         if (associate(device, displayUniqueId)) routedKeys += key
     }
 
@@ -223,5 +240,6 @@ internal class PhysicalInputRouter(
     private companion object {
         const val KEY_ASSOCIATIONS = "active_associations"
         const val KEY_DISPLAY = "display_unique_id"
+        const val ASSOCIATION_RETRY_DELAY_MS = 2_000L
     }
 }
